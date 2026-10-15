@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROFILE_FILE_NAME="codex.sb"
+
+
+function sbpl_metadata_chain() {
+    local project="${1:-$PWD}"
+    local path escaped
+    local -a paths=()
+
+    path="$(cd -- "$project" 2>/dev/null && pwd -P)" || {
+        printf 'error: cannot resolve directory: %s\n' "$project" >&2
+        return 1
+    }
+
+    while :; do
+        paths+=("$path")
+        [[ "$path" == "/" ]] && break
+        path="${path%/*}"
+        [[ -z "$path" ]] && path="/"
+    done
+
+    printf '(allow file-read-metadata file-test-existence\n'
+
+    local i
+    for ((i=${#paths[@]}-1; i>=0; i--)); do
+        escaped="${paths[i]//\\/\\\\}"
+        escaped="${escaped//\"/\\\"}"
+        printf '    (literal "%s")\n' "$escaped"
+    done
+
+    printf ')\n'
+}
+
+
+function write_profile() {
+	local project_path="$1"
+	local project_path_subtree_allow=$(sbpl_metadata_chain "$project_path")
+	local profile_path="$project_path/$PROFILE_FILE_NAME"
+	local user="$USER"
+	cat <<-EOF >> "$profile_path"
+	(version 1)
+
+	;; Start from deny-all.
+	(deny default)
+
+	;; Basic process/runtime permissions.
+	(allow process*)
+	(allow sysctl-read)
+	(allow mach-lookup)
+	(allow signal (target self))
+
+	;; Interactive terminal support
+	(allow file-ioctl
+	    (literal "/dev/tty")
+	    (regex "^/dev/ttys"))
+
+	;; pseudotty shenanigans
+	(allow pseudo-tty)
+
+	(allow file-read* file-write*
+	    (literal "/dev/ptmx")
+	    (literal "/dev/tty")
+	    (regex "^/dev/ttys"))
+
+	;; metadata traversal
+	;; Allow path traversal / realpath without allowing directory contents.
+	(allow file-read-metadata file-test-existence
+	    (literal "/opt")
+	    (literal "/etc")
+	    (literal "/var")
+	    (literal "/private")
+	    (literal "/Applications")
+	    (literal "/Users")
+	    (literal "/Users/$user")
+	    (subpath "/Users/$user/.local/bin")
+	    (literal "/Users/$user/.local")
+	    (literal "$project_path"))
+	;; Block sensitive directories EXPLICITLY
+	(deny file-read*
+	    (subpath "/Users/$user/Documents")
+	    (subpath "/Users/$user/.ssh")
+	    (subpath "/Users/$user/.gnupg"))	
+
+	(allow file-read*
+	    (literal "/")
+	    (literal "/etc")
+	    (subpath "/bin")
+	    (subpath "/sbin")
+	    (subpath "/usr")
+	    (subpath "/opt/homebrew/bin")
+	    (subpath "/System")
+	    (subpath "/Library")
+	    (subpath "/etc/codex")
+	    (subpath "/private/etc")
+	    (subpath "/private/var/db/timezone")
+	    (subpath "/private/var/db/dyld")
+	    (subpath "/private/var/select")
+	    (subpath "/Library/Developer/CommandLineTools")
+	    (subpath "/opt/homebrew")
+	    (subpath "/Users/$user/.local/bin")
+	    (subpath "/Applications/Xcode.app"))
+
+	;; Allow reads from project folder
+	(allow file-read*
+	    (subpath "$project_path"))
+
+
+	;; Allow writes only to the project
+	(allow file-write*
+	    (subpath "$project_path"))
+
+	;; emporary/runtime locations
+	(allow file-write*
+	    (subpath "/private/tmp")
+	    (subpath "/private/var/folders"))
+	;; deny changing the sandboxing file itself
+	(deny file-write* 
+		(literal "$profile_path"))
+
+	;; network shenanigans
+	(allow network*)
+
+	(allow system-socket
+	    (require-all
+		(socket-domain AF_SYSTEM)
+		(socket-protocol 2)))
+	;; And finally Codex shenanigans
+	(allow file-read* file-write*
+		(subpath "/etc/codex")
+		(subpath "/dev/null")
+		(subpath "/Users/$user/.codex"))
+	(allow file-read* file-test-existence
+	    (literal "/dev/random")
+	    (literal "/dev/urandom")
+	    (literal "/dev/autofs_nowait"))
+	(allow user-preference-read
+	    (preference-domain "com.openai.codex")
+	    (preference-domain "kCFPreferencesAnyApplication"))
+
+	(allow managed-preference-read
+	    (preference-domain "com.openai.codex")
+	    (preference-domain "kCFPreferencesAnyApplication"))
+
+	;; CFPreferences shared-memory cache
+	(allow ipc-posix-shm-read*
+	    (ipc-posix-name-prefix "apple.cfprefs."))
+
+	;; CFPreferences / CoreFoundation notifications
+	(allow ipc-posix-shm-read*
+	    (ipc-posix-name "apple.shm.notification_center"))
+	$project_path_subtree_allow
+	EOF
+}
+
+
+PROJECT="$PWD"
+PROFILE="$PROJECT/$PROFILE_FILE_NAME"
+
+if [[ -f $PROFILE ]]; then
+	echo "Profile $PROFILE exists"
+else 
+	echo "Profile doesn't exist, creating one"
+	write_profile "$PROJECT"
+fi
+
+
+
+cd "$PROJECT"
+
+
+sandbox-exec \
+  -f "$PROFILE" \
+  codex --no-daemon \
+   --sandbox danger-full-access \
+   -c "log_dir=\"/Users/$USER/.codex/log\""
